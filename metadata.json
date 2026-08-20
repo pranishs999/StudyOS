@@ -1,0 +1,6 @@
+{
+  "name": "StudyOS",
+  "description": "A personal study planning and exam preparation platform designed for students to manage subjects, syllabus completion, focus timers, spaced repetition, question banks, notes, and exam readiness.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
