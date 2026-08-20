@@ -8,13 +8,13 @@ dotenv.config();
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const parsedPort = Number(process.env.PORT);
+  const PORT = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 3000;
 
-  // JSON Body Parser with appropriate size limits for document indexing
+  app.disable('x-powered-by');
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-  // API Routes
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
@@ -23,10 +23,8 @@ async function startServer() {
     });
   });
 
-  // Mount Vector DB and Semantic Engine Router
   app.use('/api/vector', vectorRouter);
 
-  // Vite middleware for development vs static build for production
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
