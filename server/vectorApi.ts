@@ -1,9 +1,14 @@
 import { Router, Request, Response } from 'express';
 import { chunkDocument } from './chunker';
 import { generateEmbeddings, generateQueryEmbedding, EMBEDDING_MODEL } from './embeddings';
-import { vectorDb, VectorRecord, VectorSearchResult } from './vectorDb';
+import { vectorDb, VectorRecord } from './vectorDb';
 
 export const vectorRouter = Router();
+
+const MAX_ITEMS_PER_REQUEST = 50;
+const MAX_ITEM_CONTENT_LENGTH = 100_000;
+const MAX_QUERY_LENGTH = 2_000;
+const MAX_ACTIVE_IDS = 10_000;
 
 interface IndexItemPayload {
   id: string;
@@ -16,64 +21,113 @@ interface IndexItemPayload {
   version?: number;
 }
 
+function sendInternalError(res: Response, message: string, err: unknown): void {
+  console.error(`[VectorAPI] ${message}`, err);
+  res.status(500).json({ error: message });
+}
+
+function requireUserId(value: unknown, res: Response): string | null {
+  if (typeof value !== 'string' || !value.trim() || value.length > 256) {
+    res.status(400).json({ error: 'A valid userId is required.' });
+    return null;
+  }
+  return value.trim();
+}
+
+function normalizeLimit(value: unknown, fallback = 8): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(50, Math.max(1, Math.floor(parsed)));
+}
+
+function normalizeSimilarity(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(1, Math.max(0, parsed));
+}
+
+function validSourceType(value: unknown): value is IndexItemPayload['type'] {
+  return value === undefined || value === 'topic' || value === 'note' || value === 'question' || value === 'resource';
+}
+
 /**
  * POST /api/vector/index-items
- * Splits real content into chunks, generates real embeddings, and stores them in vector DB.
+ * Splits content into chunks, generates embeddings, and stores them in the vector database.
+ *
+ * TODO(security): replace client-supplied userId with a verified server-side identity when
+ * real authentication is introduced. Input validation is intentionally strict meanwhile.
  */
 vectorRouter.post('/index-items', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { items, userId } = req.body as { items: IndexItemPayload[]; userId: string };
+    const { items, userId } = req.body as { items?: unknown; userId?: unknown };
+    const normalizedUserId = requireUserId(userId, res);
+    if (!normalizedUserId) return;
 
-    if (!userId) {
-      res.status(400).json({ error: 'userId is required for vector authorization.' });
+    if (!Array.isArray(items)) {
+      res.status(400).json({ error: 'items must be an array.' });
       return;
     }
-
-    if (!Array.isArray(items) || items.length === 0) {
+    if (items.length > MAX_ITEMS_PER_REQUEST) {
+      res.status(413).json({ error: `A maximum of ${MAX_ITEMS_PER_REQUEST} items can be indexed per request.` });
+      return;
+    }
+    if (items.length === 0) {
       res.json({ indexedCount: 0, vectorCount: 0, message: 'No items provided to index.' });
       return;
     }
 
+    const validItems: IndexItemPayload[] = [];
+    for (const rawItem of items) {
+      const item = rawItem as Partial<IndexItemPayload>;
+      if (
+        !item ||
+        typeof item.id !== 'string' || !item.id.trim() || item.id.length > 256 ||
+        !validSourceType(item.type) || item.type === undefined ||
+        typeof item.title !== 'string' || item.title.length > 2_000 ||
+        typeof item.content !== 'string' || item.content.length > MAX_ITEM_CONTENT_LENGTH
+      ) {
+        res.status(400).json({ error: 'One or more index items are invalid.' });
+        return;
+      }
+      validItems.push({
+        id: item.id.trim(),
+        type: item.type,
+        title: item.title.trim(),
+        content: item.content,
+        subjectId: typeof item.subjectId === 'string' ? item.subjectId.slice(0, 256) : undefined,
+        subjectCode: typeof item.subjectCode === 'string' ? item.subjectCode.slice(0, 128) : undefined,
+        subjectName: typeof item.subjectName === 'string' ? item.subjectName.slice(0, 512) : undefined,
+        version: typeof item.version === 'number' && Number.isFinite(item.version) && item.version > 0 ? Math.floor(item.version) : 1,
+      });
+    }
+
     const allRecords: VectorRecord[] = [];
     const textToEmbed: { chunkText: string; recMeta: Omit<VectorRecord, 'embedding' | 'embeddingDimension'> }[] = [];
-
     const now = new Date().toISOString();
 
-    for (const item of items) {
-      const fullText = `${item.title}\n\n${item.content || ''}`.trim();
+    for (const item of validItems) {
+      const fullText = `${item.title}\n\n${item.content}`.trim();
       if (!fullText) continue;
-
       const chunks = chunkDocument(fullText, {
         documentId: item.id,
         sourceType: item.type,
-        userId,
+        userId: normalizedUserId,
         subjectId: item.subjectId,
         subjectCode: item.subjectCode,
         subjectName: item.subjectName,
         title: item.title,
-        contentVersion: item.version || 1,
+        contentVersion: item.version,
       });
-
       for (const chunk of chunks) {
         const chunkId = `${item.type}_${item.id}_chk_${chunk.metadata.chunkIndex}`;
         textToEmbed.push({
           chunkText: chunk.text,
           recMeta: {
-            id: chunkId,
-            documentId: item.id,
-            chunkIndex: chunk.metadata.chunkIndex,
-            totalChunks: chunk.metadata.totalChunks,
-            sourceType: item.type,
-            userId,
-            subjectId: item.subjectId,
-            subjectCode: item.subjectCode,
-            subjectName: item.subjectName,
-            title: item.title,
-            contentChunk: chunk.text,
-            contentVersion: item.version || 1,
-            embeddingModel: EMBEDDING_MODEL,
-            createdAt: now,
-            updatedAt: now,
+            id: chunkId, documentId: item.id, chunkIndex: chunk.metadata.chunkIndex,
+            totalChunks: chunk.metadata.totalChunks, sourceType: item.type, userId: normalizedUserId,
+            subjectId: item.subjectId, subjectCode: item.subjectCode, subjectName: item.subjectName,
+            title: item.title, contentChunk: chunk.text, contentVersion: item.version,
+            embeddingModel: EMBEDDING_MODEL, createdAt: now, updatedAt: now,
           },
         });
       }
@@ -84,202 +138,100 @@ vectorRouter.post('/index-items', async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Generate real embeddings using Gemini SDK
     const { embeddings, dimension } = await generateEmbeddings(textToEmbed.map(t => t.chunkText));
-
-    if (embeddings.length !== textToEmbed.length) {
-      throw new Error(`Embedding count mismatch: expected ${textToEmbed.length}, got ${embeddings.length}`);
-    }
+    if (embeddings.length !== textToEmbed.length) throw new Error('Embedding count mismatch.');
 
     for (let i = 0; i < textToEmbed.length; i++) {
-      allRecords.push({
-        ...textToEmbed[i].recMeta,
-        embedding: embeddings[i],
-        embeddingDimension: dimension,
-      });
+      allRecords.push({ ...textToEmbed[i].recMeta, embedding: embeddings[i], embeddingDimension: dimension });
     }
-
-    // Upsert into vector database
     await vectorDb.upsertRecords(allRecords);
 
-    res.json({
-      success: true,
-      indexedCount: items.length,
-      vectorCount: allRecords.length,
-      dimension,
-      model: EMBEDDING_MODEL,
-    });
-  } catch (err: any) {
-    console.error('[VectorAPI] Indexing error:', err);
-    res.status(500).json({
-      error: 'Failed to index items into vector database.',
-      details: err?.message || String(err),
-    });
+    res.json({ success: true, indexedCount: validItems.length, vectorCount: allRecords.length, dimension, model: EMBEDDING_MODEL });
+  } catch (err) {
+    sendInternalError(res, 'Failed to index items into vector database.', err);
   }
 });
 
-/**
- * POST /api/vector/search
- * Generates real query embedding and performs authorized cosine similarity search.
- */
-vectorRouter.post('/search', async (req: Request, res: Response): Promise<void> => {
+async function performSearch(req: Request, res: Response, hybrid: boolean): Promise<void> {
   try {
-    const { query, userId, sourceType, subjectId, limit = 8, minSimilarity = 0.35 } = req.body;
-
-    if (!query || typeof query !== 'string' || !query.trim()) {
-      res.status(400).json({ error: 'Search query is required.' });
+    const { query, userId, sourceType, subjectId, limit, minSimilarity, semanticWeight } = req.body as Record<string, unknown>;
+    const normalizedUserId = requireUserId(userId, res);
+    if (!normalizedUserId) return;
+    if (typeof query !== 'string' || !query.trim() || query.length > MAX_QUERY_LENGTH) {
+      res.status(400).json({ error: `Search query is required and must be at most ${MAX_QUERY_LENGTH} characters.` });
+      return;
+    }
+    if (!validSourceType(sourceType)) {
+      res.status(400).json({ error: 'Invalid sourceType.' });
+      return;
+    }
+    if (subjectId !== undefined && (typeof subjectId !== 'string' || subjectId.length > 256)) {
+      res.status(400).json({ error: 'Invalid subjectId.' });
       return;
     }
 
-    if (!userId) {
-      res.status(400).json({ error: 'userId is required for vector authorization.' });
-      return;
-    }
+    const normalizedQuery = query.trim();
+    const normalizedLimit = normalizeLimit(limit);
+    const normalizedSimilarity = normalizeSimilarity(minSimilarity, hybrid ? 0.25 : 0.35);
+    const { embedding, dimension } = await generateQueryEmbedding(normalizedQuery);
+    const options = {
+      userId: normalizedUserId,
+      sourceType: sourceType as IndexItemPayload['type'] | undefined,
+      subjectId: subjectId as string | undefined,
+      limit: normalizedLimit,
+      minSimilarity: normalizedSimilarity,
+    };
 
-    // Generate query embedding via Gemini
-    const { embedding, dimension } = await generateQueryEmbedding(query.trim());
+    const results = hybrid
+      ? vectorDb.hybridSearch(normalizedQuery, embedding, { ...options, semanticWeight: normalizeSimilarity(semanticWeight, 0.65) })
+      : vectorDb.searchSimilar(embedding, options);
 
-    // Search similar vectors in DB
-    const results = vectorDb.searchSimilar(embedding, {
-      userId,
-      sourceType,
-      subjectId,
-      limit: Number(limit) || 8,
-      minSimilarity: Number(minSimilarity) || 0.35,
-    });
-
-    res.json({
-      success: true,
-      query: query.trim(),
-      results,
-      model: EMBEDDING_MODEL,
-      dimension,
-      count: results.length,
-    });
-  } catch (err: any) {
-    console.error('[VectorAPI] Search error:', err);
-    res.status(500).json({
-      error: 'Failed to perform semantic search.',
-      details: err?.message || String(err),
-    });
+    res.json({ success: true, query: normalizedQuery, results, model: EMBEDDING_MODEL, ...(hybrid ? {} : { dimension }), count: results.length });
+  } catch (err) {
+    sendInternalError(res, hybrid ? 'Failed to perform hybrid search.' : 'Failed to perform semantic search.', err);
   }
-});
+}
 
-/**
- * POST /api/vector/hybrid-search
- * Combines exact lexical term matches and semantic cosine embeddings.
- */
-vectorRouter.post('/hybrid-search', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { query, userId, sourceType, subjectId, limit = 8, minSimilarity = 0.25, semanticWeight = 0.65 } = req.body;
+vectorRouter.post('/search', (req, res) => { void performSearch(req, res, false); });
+vectorRouter.post('/hybrid-search', (req, res) => { void performSearch(req, res, true); });
 
-    if (!query || typeof query !== 'string' || !query.trim()) {
-      res.status(400).json({ error: 'Search query is required.' });
-      return;
-    }
-
-    if (!userId) {
-      res.status(400).json({ error: 'userId is required for vector authorization.' });
-      return;
-    }
-
-    const { embedding } = await generateQueryEmbedding(query.trim());
-
-    const results = vectorDb.hybridSearch(query.trim(), embedding, {
-      userId,
-      sourceType,
-      subjectId,
-      limit: Number(limit) || 8,
-      minSimilarity: Number(minSimilarity) || 0.25,
-      semanticWeight: Number(semanticWeight) || 0.65,
-    });
-
-    res.json({
-      success: true,
-      query: query.trim(),
-      results,
-      model: EMBEDDING_MODEL,
-      count: results.length,
-    });
-  } catch (err: any) {
-    console.error('[VectorAPI] Hybrid search error:', err);
-    res.status(500).json({
-      error: 'Failed to perform hybrid search.',
-      details: err?.message || String(err),
-    });
-  }
-});
-
-/**
- * DELETE /api/vector/document/:id
- * Removes all vector chunks for a specific document.
- */
 vectorRouter.delete('/document/:id', async (req: Request, res: Response): Promise<void> => {
   try {
-    const documentId = req.params.id;
-    const userId = (req.query.userId || req.body.userId) as string;
-
-    const deletedCount = await vectorDb.deleteDocument(documentId, userId);
-    res.json({
-      success: true,
-      deletedCount,
-      documentId,
-    });
-  } catch (err: any) {
-    console.error('[VectorAPI] Delete document vectors error:', err);
-    res.status(500).json({
-      error: 'Failed to delete document vectors.',
-      details: err?.message || String(err),
-    });
-  }
-});
-
-/**
- * POST /api/vector/sync-diff
- * Purges deleted items and updates vector database.
- */
-vectorRouter.post('/sync-diff', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { activeIds, userId } = req.body as { activeIds: string[]; userId: string };
-    if (!userId) {
-      res.status(400).json({ error: 'userId is required.' });
+    const normalizedUserId = requireUserId(req.query.userId ?? req.body?.userId, res);
+    if (!normalizedUserId) return;
+    const documentId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+    if (!documentId || documentId.length > 256) {
+      res.status(400).json({ error: 'A valid document id is required.' });
       return;
     }
-
-    const idSet = new Set<string>(activeIds || []);
-    const deletedCount = await vectorDb.syncDiff(idSet, userId);
-
-    res.json({
-      success: true,
-      purgedCount: deletedCount,
-    });
-  } catch (err: any) {
-    console.error('[VectorAPI] Sync diff error:', err);
-    res.status(500).json({
-      error: 'Failed to sync vector differences.',
-      details: err?.message || String(err),
-    });
+    const deletedCount = await vectorDb.deleteDocument(documentId, normalizedUserId);
+    res.json({ success: true, deletedCount, documentId });
+  } catch (err) {
+    sendInternalError(res, 'Failed to delete document vectors.', err);
   }
 });
 
-/**
- * GET /api/vector/status
- * Returns index stats, health, and configuration.
- */
+vectorRouter.post('/sync-diff', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { activeIds, userId } = req.body as { activeIds?: unknown; userId?: unknown };
+    const normalizedUserId = requireUserId(userId, res);
+    if (!normalizedUserId) return;
+    if (!Array.isArray(activeIds) || activeIds.length > MAX_ACTIVE_IDS || activeIds.some(id => typeof id !== 'string' || id.length > 256)) {
+      res.status(400).json({ error: 'activeIds must be an array of valid IDs within the request limit.' });
+      return;
+    }
+    const deletedCount = await vectorDb.syncDiff(new Set(activeIds), normalizedUserId);
+    res.json({ success: true, purgedCount: deletedCount });
+  } catch (err) {
+    sendInternalError(res, 'Failed to sync vector differences.', err);
+  }
+});
+
 vectorRouter.get('/status', (_req: Request, res: Response): void => {
   try {
     const status = vectorDb.getStatus();
-    const hasApiKey = Boolean(process.env.GEMINI_API_KEY);
-
-    res.json({
-      ...status,
-      hasApiKey,
-      isOperational: true,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      error: 'Failed to retrieve vector status.',
-      details: err?.message || String(err),
-    });
+    res.json({ ...status, isOperational: true });
+  } catch (err) {
+    sendInternalError(res, 'Failed to retrieve vector status.', err);
   }
 });
